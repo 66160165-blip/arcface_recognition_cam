@@ -1,4 +1,7 @@
 import os
+os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
+os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
 import cv2
 import numpy as np
 import threading
@@ -8,15 +11,22 @@ import argparse
 from insightface.app import FaceAnalysis
 from collections import deque
 
+cv2.setNumThreads(int(os.environ.get("OPENCV_THREADS", "1") or 1))
+
 # ==========================================
 # ARGUMENT
 # ==========================================
 parser = argparse.ArgumentParser()
 parser.add_argument("--rtsp", type=str,
-    default="rtsp://admin:admin123@192.168.1.101:554/cam/realmonitor?channel=1&subtype=0")
+    default=os.environ.get("CAMERA_RTSP_URL", ""))
 parser.add_argument("--width",  type=int, default=640)
 parser.add_argument("--height", type=int, default=360)
+parser.add_argument("--provider", choices=["auto", "cuda", "cpu"], default=os.environ.get("FACE_AI_PROVIDER", "auto").lower())
+parser.add_argument("--det-size", type=int, default=int(os.environ.get("FACE_AI_DET_SIZE", "320") or 320))
+parser.add_argument("--triple-detect", action="store_true", default=os.environ.get("FACE_AI_TRIPLE_DETECT", "false").lower() == "true")
 args = parser.parse_args()
+if not args.rtsp:
+    parser.error("RTSP URL is required. Pass --rtsp or set CAMERA_RTSP_URL.")
 
 # ==========================================
 # CONFIG
@@ -74,20 +84,97 @@ known_embeddings     = known_embeddings_raw / np.linalg.norm(
 print(f"✔ ฐานข้อมูล: {len(set(known_names))} คน | {len(known_names)} embeddings")
 print(f"   ชื่อ: {list(set(known_names))}")
 
-# Hybrid detection — 3 ระดับ
-# app_big:   640x640 → หน้าใกล้/กลาง
-# app_mid:   480x480 → หน้ากลาง (เพิ่มใหม่)
-# app_small: 320x320 → หน้าเล็ก/ไกล
-app_big = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app_big.prepare(ctx_id=-1, det_size=(640, 640))
+_dll_directory_handles = []
 
-app_mid = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app_mid.prepare(ctx_id=-1, det_size=(480, 480))
 
-app_small = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app_small.prepare(ctx_id=-1, det_size=(320, 320))
+def add_nvidia_dll_directories():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return []
 
-print("✔ โหลดโมเดลสำเร็จ (Triple detection: 640+480+320)")
+    try:
+        import site
+        site_roots = list(site.getsitepackages())
+        user_site = site.getusersitepackages()
+        if user_site:
+            site_roots.append(user_site)
+    except Exception:
+        site_roots = []
+
+    added = []
+    for root in site_roots:
+        nvidia_root = os.path.join(root, "nvidia")
+        if not os.path.isdir(nvidia_root):
+            continue
+        for current, _, _ in os.walk(nvidia_root):
+            if os.path.basename(current).lower() != "bin":
+                continue
+            try:
+                _dll_directory_handles.append(os.add_dll_directory(current))
+                path_parts = os.environ.get("PATH", "").split(os.pathsep)
+                if current not in path_parts:
+                    os.environ["PATH"] = current + os.pathsep + os.environ.get("PATH", "")
+                added.append(current)
+            except OSError:
+                pass
+    return added
+
+
+def available_onnx_providers():
+    try:
+        added_dll_dirs = add_nvidia_dll_directories()
+        if added_dll_dirs:
+            print(f"[AI] added NVIDIA DLL directories: {added_dll_dirs}")
+        import onnxruntime as ort
+        if os.environ.get("FACE_AI_PRELOAD_DLLS", "true").lower() == "true" and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls(directory="")
+            except Exception as preload_exc:
+                print(f"[AI] ONNX Runtime preload_dlls warning: {preload_exc}")
+        return ort.get_available_providers()
+    except Exception as exc:
+        print(f"[AI] cannot inspect ONNX Runtime providers: {exc}")
+        return []
+
+
+def choose_runtime(provider_name):
+    available = available_onnx_providers()
+    wants_cuda = provider_name == "cuda" or (provider_name == "auto" and "CUDAExecutionProvider" in available)
+    if wants_cuda and "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0, available
+    if provider_name == "cuda":
+        print(f"[AI] CUDAExecutionProvider not available, fallback to CPU. Available providers: {available}")
+    return ["CPUExecutionProvider"], -1, available
+
+
+def make_face_app(det_size):
+    app = FaceAnalysis(name="buffalo_l", providers=active_providers)
+    app.prepare(ctx_id=active_ctx_id, det_size=(det_size, det_size))
+    return app
+
+
+active_providers, active_ctx_id, onnx_providers = choose_runtime(args.provider)
+det_size = max(min(args.det_size, 640), 160)
+try:
+    if args.triple_detect:
+        face_apps = [make_face_app(640), make_face_app(480), make_face_app(320)]
+        mode_label = "Triple detection: 640+480+320"
+    else:
+        face_apps = [make_face_app(det_size)]
+        mode_label = f"Fast single detection: {det_size}"
+except Exception as exc:
+    if active_providers[0] != "CUDAExecutionProvider":
+        raise
+    print(f"[AI] CUDA provider failed ({exc}), fallback to CPU")
+    active_providers = ["CPUExecutionProvider"]
+    active_ctx_id = -1
+    if args.triple_detect:
+        face_apps = [make_face_app(640), make_face_app(480), make_face_app(320)]
+        mode_label = "Triple detection CPU fallback: 640+480+320"
+    else:
+        face_apps = [make_face_app(det_size)]
+        mode_label = f"Fast single detection CPU fallback: {det_size}"
+
+print(f"✔ โหลดโมเดลสำเร็จ ({mode_label}) providers={active_providers} available={onnx_providers} opencv_threads={cv2.getNumThreads()}")
 
 # ==========================================
 # RECOGNITION
@@ -218,10 +305,10 @@ def confirm_track_identity(track, name, sim):
 # ==========================================
 def detect_faces(frame):
     """
-    Hybrid detection:
+    Face detection:
     1. ถ้า UPSCALE_DETECT=True → ขยาย frame ก่อน detect
        bbox ที่ได้จะถูก scale กลับมาขนาดจริง
-    2. ใช้ 3 model ขนาดต่างกัน → รวม + dedup
+    2. ใช้ single model เป็นค่าเริ่มต้นเพื่อลด lag หรือเปิด --triple-detect เมื่อต้องการละเอียดขึ้น
     """
     if UPSCALE_DETECT:
         h, w = frame.shape[:2]
@@ -231,7 +318,9 @@ def detect_faces(frame):
     else:
         big = frame
 
-    all_raw = app_big.get(big) + app_mid.get(big) + app_small.get(big)
+    all_raw = []
+    for app in face_apps:
+        all_raw.extend(app.get(big))
 
     # Scale bbox กลับมาขนาดเดิม + wrap เป็น dict ไม่แตะ object เดิม
     scale = 1.0 / UPSCALE_FACTOR if UPSCALE_DETECT else 1.0

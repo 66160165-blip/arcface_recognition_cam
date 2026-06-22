@@ -18,9 +18,25 @@ enroll_embeddings.py
 """
 
 import os
+os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
+os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", os.environ.get("FACE_AI_CPU_THREADS", "4"))
+import argparse
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+
+cv2.setNumThreads(int(os.environ.get("OPENCV_THREADS", "1") or 1))
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--rtsp", type=str, default="", help="RTSP URL for IP camera")
+parser.add_argument("--camera", type=int, default=0, help="Webcam index when --rtsp is not used")
+parser.add_argument("--width", type=int, default=1280, help="Capture/display width")
+parser.add_argument("--height", type=int, default=720, help="Capture/display height")
+parser.add_argument("--detect-every", type=int, default=5, help="Run realtime face detection every N frames")
+parser.add_argument("--provider", choices=["auto", "cuda", "cpu"], default=os.environ.get("FACE_AI_PROVIDER", "auto").lower())
+parser.add_argument("--det-size", type=int, default=int(os.environ.get("FACE_AI_DET_SIZE", "320") or 320))
+args = parser.parse_args()
 
 # ==========================================
 # CONFIG — ตรงกับระบบเดิม
@@ -30,11 +46,11 @@ DATASET_CLEAN = "dataset_clean"
 EMB_FILE      = "arcface_embeddings.npy"
 NAME_FILE     = "arcface_names.npy"
 
-MIRROR_VIEW    = True    # เหมือน capture_dataset.py เดิม
+MIRROR_VIEW    = not bool(args.rtsp)    # mirror webcam only; keep IP camera orientation normal
 ENABLE_SHARPEN = True    # เหมือน capture_dataset.py เดิม
 
-CAM_WIDTH  = 2560
-CAM_HEIGHT = 1080
+CAM_WIDTH  = args.width
+CAM_HEIGHT = args.height
 CAM_FPS    = 60
 
 MIN_FACE_PX   = 15      # ขั้นต่ำ — ต่ำเพื่อ enroll ระยะไกลได้
@@ -76,8 +92,81 @@ next_num = max(numbers) + 1 if numbers else 1
 # LOAD INSIGHTFACE
 # ==========================================
 print("🔄 โหลด InsightFace...")
-app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app.prepare(ctx_id=-1, det_size=(640, 640))
+_dll_directory_handles = []
+
+
+def add_nvidia_dll_directories():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return []
+
+    try:
+        import site
+        site_roots = list(site.getsitepackages())
+        user_site = site.getusersitepackages()
+        if user_site:
+            site_roots.append(user_site)
+    except Exception:
+        site_roots = []
+
+    added = []
+    for root in site_roots:
+        nvidia_root = os.path.join(root, "nvidia")
+        if not os.path.isdir(nvidia_root):
+            continue
+        for current, _, _ in os.walk(nvidia_root):
+            if os.path.basename(current).lower() != "bin":
+                continue
+            try:
+                _dll_directory_handles.append(os.add_dll_directory(current))
+                path_parts = os.environ.get("PATH", "").split(os.pathsep)
+                if current not in path_parts:
+                    os.environ["PATH"] = current + os.pathsep + os.environ.get("PATH", "")
+                added.append(current)
+            except OSError:
+                pass
+    return added
+
+
+def available_onnx_providers():
+    try:
+        added_dll_dirs = add_nvidia_dll_directories()
+        if added_dll_dirs:
+            print(f"[AI] added NVIDIA DLL directories: {added_dll_dirs}")
+        import onnxruntime as ort
+        if os.environ.get("FACE_AI_PRELOAD_DLLS", "true").lower() == "true" and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls(directory="")
+            except Exception as preload_exc:
+                print(f"[AI] ONNX Runtime preload_dlls warning: {preload_exc}")
+        return ort.get_available_providers()
+    except Exception as exc:
+        print(f"[AI] cannot inspect ONNX Runtime providers: {exc}")
+        return []
+
+
+def choose_runtime(provider_name):
+    available = available_onnx_providers()
+    wants_cuda = provider_name == "cuda" or (provider_name == "auto" and "CUDAExecutionProvider" in available)
+    if wants_cuda and "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0, available
+    if provider_name == "cuda":
+        print(f"[AI] CUDAExecutionProvider not available, fallback to CPU. Available providers: {available}")
+    return ["CPUExecutionProvider"], -1, available
+
+
+providers, ctx_id, available_providers = choose_runtime(args.provider)
+det_size = max(min(args.det_size, 640), 160)
+try:
+    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    app.prepare(ctx_id=ctx_id, det_size=(det_size, det_size))
+except Exception as exc:
+    if providers[0] != "CUDAExecutionProvider":
+        raise
+    print(f"[AI] CUDA provider failed ({exc}), fallback to CPU")
+    providers = ["CPUExecutionProvider"]
+    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    app.prepare(ctx_id=-1, det_size=(det_size, det_size))
+print(f"[AI] providers={providers} available={available_providers} det_size={det_size} opencv_threads={cv2.getNumThreads()}")
 print("✔ โหลดสำเร็จ")
 
 # ==========================================
@@ -120,7 +209,12 @@ def is_duplicate(new_norm):
 # ==========================================
 # OPEN CAMERA
 # ==========================================
-cap = cv2.VideoCapture(0)
+if args.rtsp:
+    print(f"Opening IP camera RTSP: {args.rtsp}")
+    cap = cv2.VideoCapture(args.rtsp, cv2.CAP_FFMPEG)
+else:
+    print(f"Opening webcam index: {args.camera}")
+    cap = cv2.VideoCapture(args.camera)
 if not cap.isOpened():
     print("❌ เปิดกล้องไม่ได้")
     exit()
@@ -141,6 +235,8 @@ print("=" * 60)
 
 new_embs    = []   # embeddings ที่เพิ่มในเซสชันนี้
 saved_count = 0
+frame_index = 0
+last_faces = []
 
 # ==========================================
 # MAIN CAPTURE LOOP
@@ -156,11 +252,17 @@ while True:
     if ENABLE_SHARPEN:
         frame = cv2.filter2D(frame, -1, SHARPEN_KERNEL)
 
+    if frame.shape[1] != CAM_WIDTH or frame.shape[0] != CAM_HEIGHT:
+        frame = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT), interpolation=cv2.INTER_AREA)
+
     display = frame.copy()
 
     # ── detect realtime แสดงกรอบใบหน้า ──────────────────────────
-    small = cv2.resize(display, None, fx=SCALE_FACTOR, fy=SCALE_FACTOR)
-    faces = app.get(small)
+    frame_index += 1
+    if frame_index % max(args.detect_every, 1) == 0:
+        small = cv2.resize(display, None, fx=SCALE_FACTOR, fy=SCALE_FACTOR)
+        last_faces = app.get(small)
+    faces = last_faces
     for face in faces:
         b = (face.bbox / SCALE_FACTOR).astype(int)
         fw = b[2] - b[0]
